@@ -1,27 +1,31 @@
 from __future__ import annotations
 
 import ast
+import math
 import operator
-import os
 from collections.abc import Iterable, MutableSequence, Sequence
+from decimal import Decimal, InvalidOperation
 from typing import Any, TypeVar
 
-DB_PASSWORD = os.environ["DB_PASSWORD"]
-API_KEY = os.environ["API_KEY"]
-
-TAX_MULTIPLIER: float = 1.2
+TAX_MULTIPLIER = Decimal("1.2")
 
 T = TypeVar("T")
 
 
-def calculate_total(items: Iterable[dict[str, Any]]) -> float:
-    total = 0.0
+def calculate_total(items: Iterable[dict[str, Any]]) -> Decimal:
+    total = Decimal("0")
     for item in items:
-        price_raw = item.get("price", 0)
+        if "price" not in item:
+            raise ValueError(f"Item has no 'price': {item!r}")
+        price_raw = item["price"]
+        if isinstance(price_raw, bool):
+            raise ValueError(f"Invalid price value: {price_raw!r}")
         try:
-            price = float(price_raw)
-        except (TypeError, ValueError) as exc:
+            price = Decimal(str(price_raw))
+        except InvalidOperation as exc:
             raise ValueError(f"Invalid price value: {price_raw!r}") from exc
+        if not price.is_finite():
+            raise ValueError(f"Invalid price value: {price_raw!r}")
 
         total += price * TAX_MULTIPLIER
     return total
@@ -48,43 +52,48 @@ _ALLOWED_UNARYOPS: dict[type[ast.unaryop], Any] = {
 
 
 def safe_eval_arithmetic(expr: str) -> float:
-    tree = ast.parse(expr, mode="eval")
+    """Evaluate a plain arithmetic expression; raises ValueError on any failure."""
+    try:
+        tree = ast.parse(expr, mode="eval")
+        result = _eval(tree)
+    except (SyntaxError, ArithmeticError, TypeError, RecursionError, MemoryError) as exc:
+        raise ValueError(f"Cannot evaluate expression: {expr!r}") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"Expression result is not finite: {expr!r}")
+    return result
 
-    def _eval(node: ast.AST) -> float:
-        match node:
-            case ast.Expression(body=body):
-                return _eval(body)
 
-            case ast.Constant(value=value) if isinstance(value, int | float):
-                return float(value)
+def _eval(node: ast.AST) -> float:
+    match node:
+        case ast.Expression(body=body):
+            return _eval(body)
 
-            case ast.BinOp(left=left, op=op, right=right):
-                op_func = _ALLOWED_BINOPS.get(type(op))
-                if op_func is None:
-                    raise ValueError(f"Operator not allowed: {type(op).__name__}")
-                return float(op_func(_eval(left), _eval(right)))
+        case ast.Constant(value=value) if isinstance(value, int | float) and not isinstance(value, bool):
+            return float(value)
 
-            case ast.UnaryOp(op=op, operand=operand):
-                op_func = _ALLOWED_UNARYOPS.get(type(op))
-                if op_func is None:
-                    raise ValueError(f"Unary operator not allowed: {type(op).__name__}")
-                return float(op_func(_eval(operand)))
+        case ast.BinOp(left=left, op=op, right=right):
+            op_func = _ALLOWED_BINOPS.get(type(op))
+            if op_func is None:
+                raise ValueError(f"Operator not allowed: {type(op).__name__}")
+            return float(op_func(_eval(left), _eval(right)))
 
-            case _:
-                raise ValueError(f"Expression not allowed: {type(node).__name__}")
+        case ast.UnaryOp(op=op, operand=operand):
+            op_func = _ALLOWED_UNARYOPS.get(type(op))
+            if op_func is None:
+                raise ValueError(f"Unary operator not allowed: {type(op).__name__}")
+            return float(op_func(_eval(operand)))
 
-    return _eval(tree)
+        case _:
+            raise ValueError(f"Expression not allowed: {type(node).__name__}")
 
 
 def run_user_input(user_input: str) -> float:
-    # Если цель — выполнить произвольный код, это нельзя делать вообще.
-    # Здесь допускаем только арифметические выражения.
     return safe_eval_arithmetic(user_input)
 
 
-def get_user_by_id(cursor: Any, user_id: int) -> Any:
-    # Пример для DB-API 2.0: placeholder зависит от драйвера (%s, ?, :1, ...)
-    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+def get_user_by_id(cursor: Any, user_id: int, placeholder: str = "%s") -> Any:
+    # placeholder must be the driver's paramstyle (%s, ?, :1, ...) and never user input
+    cursor.execute(f"SELECT * FROM users WHERE id = {placeholder}", (user_id,))
     return cursor.fetchone()
 
 
